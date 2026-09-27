@@ -8,6 +8,7 @@ import chromadb
 from chromadb.api.client import ClientAPI
 from chromadb.api.models.Collection import Collection
 from chromadb.api.types import EmbeddingFunction
+from chromadb.config import Settings
 
 from .embeddings import get_embedding
 
@@ -42,3 +43,25 @@ def open_collection(
         client = chromadb.PersistentClient(str(path)) if path is not None else chromadb.HttpClient(host=host, port=port)
     collection = client.get_or_create_collection(name, embedding_function=ef)
     return collection, resolved_name
+
+
+def open_existing_collection(
+    path: str | Path,
+    *,
+    name: str = "documents",
+    client: ClientAPI | None = None,
+) -> Collection:
+    """Open an existing Chroma collection for reading; never creates one.
+
+    Raises ``FileNotFoundError`` when ``path`` does not look like an existing
+    Chroma database directory, so a typo cannot create a fresh database.
+    """
+    root = Path(path).expanduser().resolve()
+    if client is None:
+        if not root.is_dir() or not (root / "chroma.sqlite3").is_file():
+            raise FileNotFoundError("Existing Chroma database not found; no database was created")
+        client = chromadb.PersistentClient(
+            path=str(root),
+            settings=Settings(anonymized_telemetry=False, migrations="validate", allow_reset=False),
+        )
+    return client.get_collection(name=name, embedding_function=None)

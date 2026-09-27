@@ -28,8 +28,9 @@ from .metadata import (
     normalize_keyword,
     person_for,
 )
+from .reader import CorpusReader, ReaderError
 from .rules import KeywordRules, load_rules
-from .store import open_collection
+from .store import open_collection, open_existing_collection
 from .sync import Indexer, IndexPlan, IndexResult, PlannedItem, Reason
 
 __version__ = "0.1.0"
@@ -38,6 +39,7 @@ __all__ = [
     "DEFAULT_STOPWORDS",
     "EMBEDDINGS",
     "MANIFEST_NAME",
+    "CorpusReader",
     "Indexer",
     "IndexPlan",
     "IndexResult",
@@ -45,6 +47,7 @@ __all__ = [
     "Manifest",
     "ManifestEntry",
     "PlannedItem",
+    "ReaderError",
     "Reason",
     "__version__",
     "filetype_for",
@@ -55,5 +58,6 @@ __all__ = [
     "metadata_for",
     "normalize_keyword",
     "open_collection",
+    "open_existing_collection",
     "person_for",
 ]
