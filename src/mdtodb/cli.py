@@ -262,7 +262,6 @@ def query(
 
 
 @app.command()
-@app.command()
 def retag(
     md_dir: Path = typer.Argument(..., exists=True, file_okay=False, readable=True),
     chroma: Optional[Path] = typer.Argument(None),
