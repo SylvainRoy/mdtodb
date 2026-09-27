@@ -192,3 +192,97 @@ def test_sync_shorthand(indexer: Indexer):
     result = indexer.sync()
     assert sorted(result.indexed) == sorted(FILES)
     assert not indexer.plan().to_index
+
+
+# -- keyword rules -----------------------------------------------------------
+
+from mdtodb.rules import KeywordRules
+
+RULES = KeywordRules.from_dict({"rule": [{"keywords": ["tagged"], "path": "contrat"}]})
+
+
+def rules_indexer(md_dir: Path, collection, rules=RULES) -> Indexer:
+    return Indexer(md_dir, collection, embedding_name="fake", rules=rules)
+
+
+def test_rules_indexing(md_dir: Path, collection):
+    indexer = rules_indexer(md_dir, collection)
+    indexer.execute(indexer.plan())
+    state = dict(zip(*[collection.get(include=["metadatas"])[k] for k in ("ids", "metadatas")]))
+    meta = state["personnes/Estelle/papiers/contrat.pdf"]
+    assert "tagged" in meta["keywords"]
+    assert meta["rules_sha256"] == RULES.sha256
+    other = state["docs/notes.txt"]
+    assert "tagged" not in other["keywords"]
+    assert other["rules_sha256"] == RULES.sha256  # sha recorded even without match
+
+
+def test_rules_second_plan_up_to_date(md_dir: Path, collection):
+    indexer = rules_indexer(md_dir, collection)
+    indexer.execute(indexer.plan())
+    plan = indexer.plan()
+    assert not plan.to_index
+
+
+def test_rules_change_is_metadata_only(md_dir: Path, collection, monkeypatch):
+    indexer = rules_indexer(md_dir, collection)
+    indexer.execute(indexer.plan())
+    other_rules = KeywordRules.from_dict({"rule": [{"keywords": ["newtag"], "path": "contrat"}]})
+    other = Indexer(md_dir, collection, embedding_name="fake", rules=other_rules)
+    plan = other.plan()
+    items = {i.rel_path: i for i in plan.to_index}
+    assert items["personnes/Estelle/papiers/contrat.pdf"].reason == Reason.RULES_CHANGED
+    assert items["personnes/Estelle/papiers/contrat.pdf"].metadata_only
+    assert items["docs/notes.txt"].reason == Reason.RULES_CHANGED
+
+    monkeypatch.setattr(collection, "upsert", lambda **kw: pytest.fail("upsert called"))
+    updates = []
+    orig_update = collection.update
+    monkeypatch.setattr(collection, "update", lambda **kw: (updates.append(kw), orig_update(**kw)))
+    before = collection.get(ids=["personnes/Estelle/papiers/contrat.pdf"], include=["metadatas"])["metadatas"][0]
+    result = other.execute(plan)
+    assert len(result.indexed) == 2
+    assert updates and "documents" not in updates[0]
+    meta = collection.get(ids=["personnes/Estelle/papiers/contrat.pdf"], include=["metadatas"])["metadatas"][0]
+    assert meta["rules_sha256"] == other_rules.sha256
+    assert "newtag" in meta["keywords"] and "tagged" not in meta["keywords"]
+    assert meta["indexed_at"] >= before["indexed_at"]
+
+
+def test_rules_removed_clears_metadata(md_dir: Path, collection):
+    indexer = rules_indexer(md_dir, collection)
+    indexer.execute(indexer.plan())
+    plain = Indexer(md_dir, collection, embedding_name="fake")  # no rules
+    plan = plain.plan()
+    assert all(i.reason == Reason.RULES_CHANGED and i.metadata_only for i in plan.to_index)
+    plain.execute(plan)
+    meta = collection.get(ids=["personnes/Estelle/papiers/contrat.pdf"], include=["metadatas"])["metadatas"][0]
+    assert "rules_sha256" not in meta
+    assert "tagged" not in meta["keywords"]
+
+
+def test_retag(md_dir: Path, collection):
+    indexer = rules_indexer(md_dir, collection)
+    # unindexed docs are NEW, not RETAG
+    plan = indexer.plan(retag=True)
+    assert all(i.reason == Reason.NEW and not i.metadata_only for i in plan.to_index)
+    indexer.execute(plan)
+    plan = indexer.plan(retag=True)
+    assert all(i.reason == Reason.RETAG and i.metadata_only for i in plan.to_index)
+    assert len(plan.to_index) == len(FILES)
+    result = indexer.execute(plan)
+    assert len(result.indexed) == len(FILES)
+
+
+def test_index_document_applies_rules(collection):
+    indexer = Indexer(
+        None,
+        collection,
+        manifest=Manifest(),
+        embedding_name="fake",
+        read_markdown=lambda rel: "",
+        rules=KeywordRules.from_dict({"rule": [{"keywords": ["tagged"], "content": "doc"}]}),
+    )
+    meta = indexer.index_document("a/b.pdf", "# Doc", engine="e", fingerprint="f")
+    assert "tagged" in meta["keywords"]
+    assert meta["rules_sha256"]

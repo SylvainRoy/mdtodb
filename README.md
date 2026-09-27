@@ -47,6 +47,10 @@ mdtodb sync ./docs-md ./chroma --select reports/2024/q3.pdf
 # Reindex everything; drop items whose document left the manifest.
 mdtodb sync ./docs-md ./chroma --force --prune
 
+# Recompute metadata (keywords, person, filetype) on indexed documents,
+# without re-embedding. Also runs automatically after a rules-file change.
+mdtodb retag ./docs-md ./chroma
+
 # Poll the manifest and keep the collection in sync.
 mdtodb watch ./docs-md ./chroma --interval 30 --prune
 
@@ -54,13 +58,16 @@ mdtodb watch ./docs-md ./chroma --interval 30 --prune
 mdtodb query ./chroma "assurance habitation" -n 10
 mdtodb query ./chroma "relevé" --person Estelle -k allemagne --filetype pdf
 
-# Inspect the metadata a path would get.
+# Inspect the metadata a path would get; optionally apply the keyword rules
+# file and check content rules against a Markdown file.
 mdtodb keywords "personnes/Estelle/papiers/Allemagne/ReleveIntegral_ROY_ESTELLE_2014_26-01-2021.pdf"
+mdtodb keywords "docs/avis.pdf" --rules rules.toml --markdown docs-md/docs/avis.md
 ```
 
 Shared options: `--collection/-c` (default `documents`), `--embedding/-e`,
 `--gemini-model`, `--gemini-api-key`, `--stopword/-w` (repeatable, extra
-keyword stopwords), `--batch-size` (documents per upsert, default 50).
+keyword stopwords), `--batch-size` (documents per upsert, default 50),
+`--rules/-r` (keyword rules TOML file; also `MDTODB_RULES`).
 
 ### Change detection
 
@@ -68,7 +75,10 @@ State lives **in the collection itself**: each item's metadata records the
 manifest fingerprint, the sha256 of the indexed Markdown, and the embedding
 identifier. A document is (re)indexed when it is `new`, its fingerprint
 `changed`, its Markdown `markdown-changed`, the embedding
-`embedding-changed`, or it was selected / `forced`. Collection ids are the
+`embedding-changed`, or it was selected / `forced`. Two further reasons only
+refresh metadata (no re-embedding): `rules-changed` (the keyword rules file
+changed — or was added/removed — since the document was indexed) and `retag`
+(the `mdtodb retag` command). Collection ids are the
 manifest's relative source paths; ids absent from the manifest are orphans,
 deleted only with `--prune`.
 
@@ -90,6 +100,7 @@ database).
 | `md_sha256`   | sha256 of the indexed Markdown text                                 |
 | `embedding`   | embedding identifier (`default`, `gemini:<model>`)                  |
 | `indexed_at`  | Unix timestamp of the upsert                                        |
+| `rules_sha256`| sha256 of the keyword rules file in effect at index time            |
 
 ### Keyword rules
 
@@ -107,6 +118,38 @@ filename without extension):
 
 Query-side, keyword filtering uses Chroma's `$contains` on the `keywords`
 array: `{"keywords": {"$contains": "estelle"}}`.
+
+### Keyword rules file
+
+A TOML file can add keywords at index time when regexes match the document's
+relative path and/or its Markdown content:
+
+```toml
+[options]
+ignore_case = true          # default true; applies to every rule
+
+[[rule]]
+keywords = ["impots", "fiscal"]   # required, non-empty list
+path = 'imp[oô]ts|taxe'           # optional, regex searched in the rel POSIX path
+content = 'avis\s+d.imp[oô]t'     # optional, regex searched in the Markdown text
+ignore_case = false               # optional per-rule override
+```
+
+When a rule sets both `path` and `content`, **both** must match (AND); a rule
+needs at least one of them. Keywords are normalized like path keywords
+(accents stripped, lowercased) and appended after them, deduplicated.
+Matching rules apply to every document at index time; the file's sha256 is
+recorded as `rules_sha256`, so editing the file marks indexed documents
+`rules-changed` and refreshes their metadata on the next `sync` without
+re-embedding. `mdtodb retag` forces the same refresh on demand.
+
+The rules file is resolved in this order: `--rules/-r`, the `MDTODB_RULES`
+environment variable, then `~/.config/mdtodb/rules.toml` if it exists.
+Preview the keywords a document would get with:
+
+```bash
+mdtodb keywords "docs/avis d'imposition.pdf" --rules rules.toml --markdown docs-md/docs/avis.md
+```
 
 ### Person rule
 

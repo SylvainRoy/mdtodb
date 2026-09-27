@@ -10,6 +10,7 @@ import typer
 from . import __version__
 from .embeddings import DEFAULT_GEMINI_MODEL, EMBEDDINGS, get_embedding
 from .metadata import metadata_for, normalize_keyword
+from .rules import KeywordRules, RulesError, load_rules
 from .store import open_collection
 from .sync import Indexer, IndexPlan, PlannedItem
 
@@ -28,6 +29,7 @@ GeminiModel = typer.Option(DEFAULT_GEMINI_MODEL, "--gemini-model", help="(gemini
 GeminiKey = typer.Option(None, "--gemini-api-key", envvar="GEMINI_API_KEY", help="(gemini) API key.", show_default=False)
 Stopword = typer.Option(None, "--stopword", "-w", help="Extra keyword stopword. Repeatable.")
 BatchSize = typer.Option(50, "--batch-size", min=1, help="Documents upserted per Chroma call.")
+Rules = typer.Option(None, "--rules", "-r", envvar="MDTODB_RULES", help="Keyword rules TOML file (default: ~/.config/mdtodb/rules.toml if present).")
 
 
 def _embedding(name: str, model: str, api_key: Optional[str]):
@@ -66,9 +68,23 @@ def _collection(
         raise typer.Exit(2)
 
 
-def _indexer(md_dir: Path, collection, ef_name: str, stopwords: Optional[list[str]]) -> Indexer:
+def _rules(path: Optional[Path]) -> Optional[KeywordRules]:
     try:
-        return Indexer(md_dir, collection, embedding_name=ef_name, stopwords=stopwords)
+        return load_rules(path)
+    except (RulesError, FileNotFoundError) as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+
+
+def _indexer(
+    md_dir: Path,
+    collection,
+    ef_name: str,
+    stopwords: Optional[list[str]],
+    rules: Optional[KeywordRules] = None,
+) -> Indexer:
+    try:
+        return Indexer(md_dir, collection, embedding_name=ef_name, stopwords=stopwords, rules=rules)
     except FileNotFoundError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(2)
@@ -124,6 +140,7 @@ def sync(
     gemini_model: str = GeminiModel,
     gemini_api_key: Optional[str] = GeminiKey,
     stopword: Optional[list[str]] = Stopword,
+    rules: Optional[Path] = Rules,
     batch_size: int = BatchSize,
     dry_run: bool = typer.Option(False, "--dry-run", "-n", help="List what would be (re)indexed and exit."),
     force: bool = typer.Option(False, "--force", "-f", help="Reindex everything even if up to date."),
@@ -133,7 +150,7 @@ def sync(
 ) -> None:
     """Synchronise MD_DIR into a Chroma collection, reindexing only stale documents."""
     coll, ef_name = _collection(chroma, host, port, collection, embedding, gemini_model, gemini_api_key)
-    indexer = _indexer(md_dir, coll, ef_name, stopword)
+    indexer = _indexer(md_dir, coll, ef_name, stopword, _rules(rules))
     try:
         plan = indexer.plan(force=force, select=select or None)
     except FileNotFoundError as exc:
@@ -156,11 +173,12 @@ def list_cmd(
     gemini_model: str = GeminiModel,
     gemini_api_key: Optional[str] = GeminiKey,
     stopword: Optional[list[str]] = Stopword,
+    rules: Optional[Path] = Rules,
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Also list up-to-date documents."),
 ) -> None:
     """List the documents that would be (re)indexed, without writing anything."""
     coll, ef_name = _collection(chroma, host, port, collection, embedding, gemini_model, gemini_api_key)
-    plan = _indexer(md_dir, coll, ef_name, stopword).plan()
+    plan = _indexer(md_dir, coll, ef_name, stopword, _rules(rules)).plan()
     _print_plan(plan, verbose=verbose)
     raise typer.Exit(1 if plan.errors else 0)
 
@@ -176,13 +194,14 @@ def watch(
     gemini_model: str = GeminiModel,
     gemini_api_key: Optional[str] = GeminiKey,
     stopword: Optional[list[str]] = Stopword,
+    rules: Optional[Path] = Rules,
     batch_size: int = BatchSize,
     interval: float = typer.Option(30.0, "--interval", "-i", help="Seconds between manifest reloads."),
     prune: bool = typer.Option(False, "--prune", help="Delete collection items whose document left the manifest."),
 ) -> None:
     """Keep the collection in sync with MD_DIR, re-reading the manifest periodically."""
     coll, ef_name = _collection(chroma, host, port, collection, embedding, gemini_model, gemini_api_key)
-    indexer = _indexer(md_dir, coll, ef_name, stopword)
+    indexer = _indexer(md_dir, coll, ef_name, stopword, _rules(rules))
     typer.echo(f"watching {md_dir} every {interval:g}s (Ctrl-C to stop)", err=True)
     try:
         while True:
@@ -243,12 +262,42 @@ def query(
 
 
 @app.command()
+@app.command()
+def retag(
+    md_dir: Path = typer.Argument(..., exists=True, file_okay=False, readable=True),
+    chroma: Optional[Path] = typer.Argument(None),
+    host: Optional[str] = Host,
+    port: int = Port,
+    collection: str = CollectionName,
+    embedding: str = Embedding,
+    gemini_model: str = GeminiModel,
+    gemini_api_key: Optional[str] = GeminiKey,
+    stopword: Optional[list[str]] = Stopword,
+    rules: Optional[Path] = Rules,
+    batch_size: int = BatchSize,
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="List what would be re-tagged and exit."),
+) -> None:
+    """Recompute metadata (keywords, person, filetype) for every indexed document without re-embedding."""
+    coll, ef_name = _collection(chroma, host, port, collection, embedding, gemini_model, gemini_api_key)
+    indexer = _indexer(md_dir, coll, ef_name, stopword, _rules(rules))
+    plan = indexer.plan(retag=True)
+    _print_plan(plan, verbose=dry_run)
+    if dry_run:
+        raise typer.Exit(1 if plan.errors else 0)
+    raise typer.Exit(_run(indexer, plan, False, batch_size))
+
+
+@app.command()
 def keywords(
     path: str = typer.Argument(..., help="Document path to analyse (relative POSIX style)."),
     stopword: Optional[list[str]] = Stopword,
+    rules: Optional[Path] = Rules,
+    markdown: Optional[Path] = typer.Option(None, "--markdown", exists=True, dir_okay=False, help="Markdown file whose text content rules are checked against."),
 ) -> None:
     """Print the metadata mdtodb would store for PATH, as JSON."""
-    typer.echo(json.dumps(metadata_for(path, stopwords=stopword), indent=2, ensure_ascii=False))
+    text = markdown.read_text("utf-8") if markdown is not None else None
+    meta = metadata_for(path, stopwords=stopword, text=text, rules=_rules(rules))
+    typer.echo(json.dumps(meta, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":  # pragma: no cover

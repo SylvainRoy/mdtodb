@@ -29,8 +29,14 @@ from chromadb.api.models.Collection import Collection
 
 from .manifest import MANIFEST_NAME, Manifest, markdown_path_for
 from .metadata import metadata_for
+from .rules import KeywordRules
 
 _BATCH_GET = 1000
+
+# Metadata keys mdtodb owns that may legitimately disappear between two
+# refreshes; sent as None on metadata-only updates so Chroma deletes them
+# (``update`` merges metadatas rather than replacing them).
+_OPTIONAL_META_KEYS = ("keywords", "rules_sha256", "person", "filetype")
 
 
 class Reason(str, Enum):
@@ -38,6 +44,8 @@ class Reason(str, Enum):
     CHANGED = "changed"
     MARKDOWN_CHANGED = "markdown-changed"
     EMBEDDING_CHANGED = "embedding-changed"
+    RULES_CHANGED = "rules-changed"
+    RETAG = "retag"
     FORCED = "forced"
 
 
@@ -46,6 +54,7 @@ class PlannedItem:
     rel_path: str
     markdown: Path | None  # absolute path of the .md to index, None in disk-less mode
     reason: Reason
+    metadata_only: bool = False
 
 
 @dataclass
@@ -77,11 +86,13 @@ class Indexer:
         embedding_name: str = "default",
         read_markdown: Callable[[str], str] | None = None,
         stopwords: Iterable[str] | None = None,
+        rules: KeywordRules | None = None,
     ) -> None:
         self.md_dir = Path(md_dir) if md_dir is not None else None
         self.collection = collection
         self.embedding_name = embedding_name
         self.stopwords = stopwords
+        self.rules = rules
         if read_markdown is None:
             if self.md_dir is None:
                 raise ValueError("md_dir is required when no read_markdown callable is given")
@@ -108,6 +119,10 @@ class Indexer:
         entry = self.manifest.entries[rel_path]
         output = entry.output or markdown_path_for(rel_path)
         return (self.md_dir / output).read_text("utf-8")
+
+    @property
+    def _rules_sha(self) -> str | None:
+        return self.rules.sha256 if self.rules else None
 
     def _markdown_path(self, rel_path: str) -> Path | None:
         if self.md_dir is None:
@@ -139,12 +154,19 @@ class Indexer:
             offset += _BATCH_GET
         return state
 
-    def plan(self, *, force: bool = False, select: Iterable[str | Path] | None = None) -> IndexPlan:
+    def plan(
+        self,
+        *,
+        force: bool = False,
+        select: Iterable[str | Path] | None = None,
+        retag: bool = False,
+    ) -> IndexPlan:
         """Compute what would be (re)indexed. Never writes to the collection.
 
         ``select`` restricts the plan to the given manifest paths and forces
         their reindexing; a selection missing from the manifest is a
-        ``FileNotFoundError``.
+        ``FileNotFoundError``. ``retag`` marks every otherwise up-to-date
+        document for a metadata-only refresh (no re-embedding).
         """
         selected = {self._rel(s) for s in select} if select else None
         plan = IndexPlan()
@@ -158,6 +180,7 @@ class Indexer:
             except Exception as exc:
                 plan.errors[rel] = str(exc)
                 continue
+            metadata_only = False
             existing = state.get(rel)
             if existing is None:
                 reason = Reason.NEW
@@ -169,10 +192,14 @@ class Indexer:
                 reason = Reason.MARKDOWN_CHANGED
             elif existing.get("embedding") != self.embedding_name:
                 reason = Reason.EMBEDDING_CHANGED
+            elif retag:
+                reason, metadata_only = Reason.RETAG, True
+            elif existing.get("rules_sha256") != self._rules_sha:
+                reason, metadata_only = Reason.RULES_CHANGED, True
             else:
                 plan.up_to_date.append(rel)
                 continue
-            plan.to_index.append(PlannedItem(rel, self._markdown_path(rel), reason))
+            plan.to_index.append(PlannedItem(rel, self._markdown_path(rel), reason, metadata_only))
 
         if selected is not None:
             missing = selected - set(self.manifest.entries)
@@ -195,6 +222,8 @@ class Indexer:
             embedding=self.embedding_name,
             indexed_at=time.time(),
             stopwords=self.stopwords,
+            text=markdown,
+            rules=self.rules,
         )
 
     def execute(
@@ -212,6 +241,7 @@ class Indexer:
         total = len(plan.to_index)
 
         batch: list[tuple[PlannedItem, str, dict, int]] = []  # item, document, metadata, index
+        meta_batch: list[tuple[PlannedItem, dict, int]] = []  # metadata-only items
 
         def flush() -> None:
             if not batch:
@@ -234,6 +264,31 @@ class Indexer:
                         on_done(item, i, total)
             batch.clear()
 
+        def flush_meta() -> None:
+            if not meta_batch:
+                return
+            try:
+                # Chroma's update merges metadatas: null out owned keys absent
+                # from the new dict so stale values are actually removed.
+                self.collection.update(
+                    ids=[i.rel_path for i, *_ in meta_batch],
+                    metadatas=[
+                        meta | {k: None for k in _OPTIONAL_META_KEYS if k not in meta}
+                        for _item, meta, _i in meta_batch
+                    ],
+                )
+            except Exception as exc:
+                for item, _meta, _i in meta_batch:
+                    result.failed[item.rel_path] = str(exc)
+                    if on_error:
+                        on_error(item, exc)
+            else:
+                for item, _meta, i in meta_batch:
+                    result.indexed.append(item.rel_path)
+                    if on_done:
+                        on_done(item, i, total)
+            meta_batch.clear()
+
         for index, item in enumerate(plan.to_index, 1):
             if on_progress:
                 on_progress(item, index, total)
@@ -247,10 +302,16 @@ class Indexer:
                 if on_error:
                     on_error(item, exc)
                 continue
-            batch.append((item, markdown, meta, index))
-            if len(batch) >= batch_size:
-                flush()
+            if item.metadata_only:
+                meta_batch.append((item, meta, index))
+                if len(meta_batch) >= batch_size:
+                    flush_meta()
+            else:
+                batch.append((item, markdown, meta, index))
+                if len(batch) >= batch_size:
+                    flush()
         flush()
+        flush_meta()
 
         if prune and plan.orphans:
             for offset in range(0, len(plan.orphans), batch_size):
@@ -280,6 +341,8 @@ class Indexer:
             embedding=self.embedding_name,
             indexed_at=time.time(),
             stopwords=self.stopwords,
+            text=markdown,
+            rules=self.rules,
         )
         self.collection.upsert(ids=[rel_path], documents=[markdown], metadatas=[meta])
         return meta
@@ -292,10 +355,14 @@ class Indexer:
         *,
         force: bool = False,
         select: Iterable[str | Path] | None = None,
+        retag: bool = False,
         prune: bool = False,
         batch_size: int = 50,
         **callbacks,
     ) -> IndexResult:
         return self.execute(
-            self.plan(force=force, select=select), prune=prune, batch_size=batch_size, **callbacks
+            self.plan(force=force, select=select, retag=retag),
+            prune=prune,
+            batch_size=batch_size,
+            **callbacks,
         )

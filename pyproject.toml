@@ -7,6 +7,7 @@ requires-python = ">=3.10,<3.14"
 license = { text = "MIT" }
 dependencies = [
     "chromadb>=1.5,<2",
+    "tomli>=2.0,<3; python_version < '3.11'",
     "typer>=0.12,<1.0",
 ]
 
