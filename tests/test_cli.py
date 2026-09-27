@@ -99,3 +99,57 @@ def test_version():
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
     assert "mdtodb" in result.stdout
+
+
+# -- keyword rules -----------------------------------------------------------
+
+import mdtodb.rules as rules_module
+
+RULES_TOML = '[[rule]]\nkeywords=["tagged"]\npath="contrat"\n'
+
+
+@pytest.fixture(autouse=True)
+def no_user_rules_file(tmp_path: Path, monkeypatch):
+    """Never pick up a real ~/.config/mdtodb/rules.toml or MDTODB_RULES."""
+    monkeypatch.delenv("MDTODB_RULES", raising=False)
+    monkeypatch.setattr(rules_module, "DEFAULT_RULES_PATH", tmp_path / "home" / ".config" / "mdtodb" / "rules.toml")
+
+
+def write_rules(tmp_path: Path, text: str = RULES_TOML) -> Path:
+    p = tmp_path / "rules.toml"
+    p.write_text(text, "utf-8")
+    return p
+
+
+def test_keywords_with_rules(tmp_path: Path):
+    rules = write_rules(tmp_path)
+    md = tmp_path / "doc.md"
+    md.write_text("# Hello")
+    result = runner.invoke(
+        app, ["keywords", "docs/contrat.pdf", "--rules", str(rules), "--markdown", str(md)]
+    )
+    assert result.exit_code == 0, result.output
+    meta = json.loads(result.stdout)
+    assert "tagged" in meta["keywords"]
+    assert meta["rules_sha256"]
+
+
+def test_keywords_invalid_rules(tmp_path: Path):
+    bad = write_rules(tmp_path, "not = [toml\n")
+    result = runner.invoke(app, ["keywords", "x.pdf", "--rules", str(bad)])
+    assert result.exit_code == 2
+    result = runner.invoke(app, ["keywords", "x.pdf", "--rules", str(tmp_path / "missing.toml")])
+    assert result.exit_code == 2
+
+
+def test_retag_flow(md_dir: Path, tmp_path: Path):
+    chroma = tmp_path / "chroma"
+    rules = write_rules(tmp_path)
+    result = runner.invoke(app, ["sync", str(md_dir), str(chroma), "--rules", str(rules)])
+    assert result.exit_code == 0, result.output
+    result = runner.invoke(app, ["retag", str(md_dir), str(chroma), "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "[         retag] personnes/Estelle/papiers/contrat.pdf" in result.stdout
+    result = runner.invoke(app, ["retag", str(md_dir), str(chroma)])
+    assert result.exit_code == 0, result.output
+    assert "indexed 1" in result.stderr

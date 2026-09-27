@@ -12,9 +12,12 @@ from __future__ import annotations
 import re
 import unicodedata
 from pathlib import PurePosixPath
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 from .manifest import markdown_path_for
+
+if TYPE_CHECKING:
+    from .rules import KeywordRules
 
 DEFAULT_STOPWORDS: frozenset[str] = frozenset(
     "le la les l un une des du de d au aux et ou en a a "
@@ -112,6 +115,8 @@ def metadata_for(
     embedding: str | None = None,
     indexed_at: float | None = None,
     stopwords: Iterable[str] | None = None,
+    text: str | None = None,
+    rules: KeywordRules | None = None,
 ) -> dict:
     """Build the Chroma metadata dict for a source document.
 
@@ -127,6 +132,13 @@ def metadata_for(
     if person is not None:
         meta["person"] = person
     keywords = keywords_for(rel_path, stopwords=stopwords)
+    if rules is not None:
+        seen = set(keywords)
+        for kw in rules.keywords_for(rel_path, text or ""):
+            if kw not in seen:
+                seen.add(kw)
+                keywords.append(kw)
+        meta["rules_sha256"] = rules.sha256
     if keywords:
         meta["keywords"] = keywords
     for key, value in (

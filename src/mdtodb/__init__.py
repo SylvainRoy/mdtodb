@@ -28,6 +28,7 @@ from .metadata import (
     normalize_keyword,
     person_for,
 )
+from .rules import KeywordRules, load_rules
 from .store import open_collection
 from .sync import Indexer, IndexPlan, IndexResult, PlannedItem, Reason
 
@@ -40,6 +41,7 @@ __all__ = [
     "Indexer",
     "IndexPlan",
     "IndexResult",
+    "KeywordRules",
     "Manifest",
     "ManifestEntry",
     "PlannedItem",
@@ -48,6 +50,7 @@ __all__ = [
     "filetype_for",
     "get_embedding",
     "keywords_for",
+    "load_rules",
     "markdown_path_for",
     "metadata_for",
     "normalize_keyword",
