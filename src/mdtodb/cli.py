@@ -92,7 +92,8 @@ def _indexer(
 
 def _print_plan(plan: IndexPlan, *, verbose: bool) -> None:
     for item in plan.to_index:
-        typer.echo(f"[{item.reason.value:>14}] {item.rel_path}")
+        path = f"{item.moved_from} -> {item.rel_path}" if item.moved_from is not None else item.rel_path
+        typer.echo(f"[{item.reason.value:>14}] {path}")
     if verbose:
         for rel in plan.up_to_date:
             typer.echo(f"[    up-to-date] {rel}")
@@ -109,13 +110,18 @@ def _print_plan(plan: IndexPlan, *, verbose: bool) -> None:
 
 def _run(indexer: Indexer, plan: IndexPlan, prune: bool, batch_size: int) -> int:
     def done(item: PlannedItem, i: int, n: int) -> None:
-        typer.echo(f"[{i}/{n}] {item.rel_path} ({item.reason.value})", err=True)
+        path = f"{item.moved_from} -> {item.rel_path}" if item.moved_from is not None else item.rel_path
+        typer.echo(f"[{i}/{n}] {path} ({item.reason.value})", err=True)
 
     def error(item: PlannedItem, exc: Exception) -> None:
         typer.secho(f"  FAILED {item.rel_path}: {exc}", fg=typer.colors.RED, err=True)
 
     result = indexer.execute(plan, prune=prune, batch_size=batch_size, on_done=done, on_error=error)
-    typer.echo(f"-- indexed {len(result.indexed)}, failed {len(result.failed)}, pruned {len(result.pruned)}", err=True)
+    typer.echo(
+        f"-- indexed {len(result.indexed)}, moved {len(result.moved)}, "
+        f"failed {len(result.failed)}, pruned {len(result.pruned)}",
+        err=True,
+    )
     return 1 if result.failed else 0
 
 
@@ -237,7 +243,7 @@ def query(
     if text is None:
         text = target
     coll, _ef_name = _collection(chroma, host, port, collection, embedding, gemini_model, gemini_api_key)
-    clauses = []
+    clauses: list[dict] = []
     if person:
         clauses.append({"person": person})
     for k in keyword or ():

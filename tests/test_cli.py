@@ -7,11 +7,11 @@ import pytest
 from typer.testing import CliRunner
 
 import mdtodb.cli as cli
-from mdtodb import MANIFEST_NAME
+import mdtodb.rules as rules_module
 from mdtodb.cli import app
 
 from .conftest import FakeEmbedding
-from .test_sync import make_tree
+from .test_sync import make_tree, move_entry
 
 runner = CliRunner()
 
@@ -103,8 +103,6 @@ def test_version():
 
 # -- keyword rules -----------------------------------------------------------
 
-import mdtodb.rules as rules_module
-
 RULES_TOML = '[[rule]]\nkeywords=["tagged"]\npath="contrat"\n'
 
 
@@ -153,3 +151,32 @@ def test_retag_flow(md_dir: Path, tmp_path: Path):
     result = runner.invoke(app, ["retag", str(md_dir), str(chroma)])
     assert result.exit_code == 0, result.output
     assert "indexed 1" in result.stderr
+
+
+def test_move_flow(md_dir: Path, tmp_path: Path, monkeypatch):
+    chroma = tmp_path / "chroma"
+    assert runner.invoke(app, ["sync", str(md_dir), str(chroma)]).exit_code == 0
+    old = "personnes/Estelle/papiers/contrat.pdf"
+    new = "archives/renamed.pdf"
+    move_entry(md_dir, old, new)
+    for command in (["list"], ["sync", "--dry-run"]):
+        result = runner.invoke(app, command + [str(md_dir), str(chroma)])
+        assert result.exit_code == 0, result.output
+        assert f"[         moved] {old} -> {new}" in result.stdout
+        assert "0 orphan item(s)" in result.stderr
+        assert "[           new]" not in result.stdout
+
+    with monkeypatch.context() as patch:
+        patch.setattr(FakeEmbedding, "__call__", lambda self, input: pytest.fail("move re-embedded"))
+        result = runner.invoke(app, ["sync", str(md_dir), str(chroma)])
+    assert result.exit_code == 0, result.output
+    assert f"{old} -> {new} (moved)" in result.stderr
+    assert "indexed 0, moved 1, failed 0, pruned 0" in result.stderr
+    result = runner.invoke(app, ["list", str(md_dir), str(chroma), "-v"])
+    assert result.exit_code == 0, result.output
+    assert f"[    up-to-date] {new}" in result.stdout
+    assert "0 to index" in result.stderr and "0 orphan item(s)" in result.stderr
+    result = runner.invoke(app, ["query", str(chroma), "contrat"])
+    assert result.exit_code == 0, result.output
+    assert new in result.stdout and old not in result.stdout
+    assert "person: Estelle" not in result.stdout

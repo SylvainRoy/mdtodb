@@ -78,9 +78,32 @@ identifier. A document is (re)indexed when it is `new`, its fingerprint
 `embedding-changed`, or it was selected / `forced`. Two further reasons only
 refresh metadata (no re-embedding): `rules-changed` (the keyword rules file
 changed — or was added/removed — since the document was indexed) and `retag`
-(the `mdtodb retag` command). Collection ids are the
-manifest's relative source paths; ids absent from the manifest are orphans,
-deleted only with `--prune`.
+(the `mdtodb retag` command). Collection ids are the manifest's relative
+source paths.
+
+When pdftomd relocates a document, its manifest entry keeps the same engine
+and fingerprint under the new path. mdtodb matches new paths to collection
+ids that have left the manifest using these two fields and reports them as
+`moved` (`old/path.pdf -> new/path.pdf`). It reuses the stored embedding when
+the Markdown hash and embedding identifier are unchanged, while refreshing
+`file`, `markdown`, `person`, `filetype`, and all path/content keyword rules.
+No manifest migration or full reindex is needed for existing collections.
+
+The new record is written before the old id is deleted; successful moves
+remove the old id **even without `--prune`**. If writing the replacement
+fails, the old record is kept, including with `--prune`. Chroma does not
+provide an atomic rename: a failed deletion can leave both ids in place;
+`--prune` on a later sync removes the obsolete one.
+
+Copies whose old path is still in the manifest remain `new`. Duplicate
+fingerprints are paired one-to-one in sorted path order. A changed source
+fingerprint or conversion engine cannot be identified as a move and falls
+back to new/orphan handling. A matched move with changed Markdown, a changed
+embedding identifier, or `--force` / `--select` is re-embedded (and reported
+with that reason), but still removes its old id after a successful write.
+Moves outside `--select`, and moves whose Markdown cannot be read, keep
+their old ids even with `--prune`. Only unmatched ids absent from the
+manifest are orphans, deleted only with `--prune`.
 
 Note: a Chroma collection is bound to its embedding function at creation —
 when switching `--embedding`, use a different `--collection` (or a fresh
@@ -169,6 +192,7 @@ plan = indexer.plan()                          # dry run, reads only .md files
 for item in plan.to_index:
     print(item.reason.value, item.rel_path)
 result = indexer.execute(plan, prune=True)
+# result.moved contains relocated paths (separate from result.indexed).
 result = indexer.sync(select=["a/b.pdf"])      # force selected documents
 
 # Single documents / removal.

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from mdtodb import MANIFEST_NAME, Indexer, Manifest, Reason
+from mdtodb.rules import KeywordRules
 from mdtodb.sync import md_sha256
 
 
@@ -196,8 +197,6 @@ def test_sync_shorthand(indexer: Indexer):
 
 # -- keyword rules -----------------------------------------------------------
 
-from mdtodb.rules import KeywordRules
-
 RULES = KeywordRules.from_dict({"rule": [{"keywords": ["tagged"], "path": "contrat"}]})
 
 
@@ -286,3 +285,275 @@ def test_index_document_applies_rules(collection):
     meta = indexer.index_document("a/b.pdf", "# Doc", engine="e", fingerprint="f")
     assert "tagged" in meta["keywords"]
     assert meta["rules_sha256"]
+
+
+# -- moved documents ---------------------------------------------------------
+
+def move_entry(md_dir: Path, old: str, new: str, *, output: str | None = None) -> None:
+    """Apply pdftomd's move: relocate Markdown and rekey the manifest entry."""
+    manifest_path = md_dir / MANIFEST_NAME
+    data = json.loads(manifest_path.read_text())
+    entry = data["files"].pop(old)
+    old_output = md_dir / entry["output"]
+    entry["output"] = output or str(Path(new).with_suffix(".md"))
+    new_output = md_dir / entry["output"]
+    new_output.parent.mkdir(parents=True, exist_ok=True)
+    old_output.rename(new_output)
+    data["files"][new] = entry
+    manifest_path.write_text(json.dumps(data))
+
+
+OLD = "personnes/Estelle/papiers/contrat.pdf"
+NEW = "archives/renamed.pdf"
+
+
+@pytest.mark.parametrize("prune", [False, True])
+def test_move_reuses_embedding_and_refreshes_metadata(md_dir: Path, collection, monkeypatch, prune):
+    rules = KeywordRules.from_dict({"rule": [
+        {"keywords": ["oldtag"], "path": "personnes"},
+        {"keywords": ["newtag"], "path": "archives"},
+        {"keywords": ["contenttag"], "content": "Hello"},
+    ]})
+    indexer = rules_indexer(md_dir, collection, rules)
+    indexer.sync()
+    collection.update(ids=[OLD], metadatas=[{"custom": "keep me"}])
+    before = collection.get(ids=[OLD], include=["documents", "embeddings"])
+    move_entry(md_dir, OLD, NEW, output="custom/output.md")
+    indexer.reload()
+    snapshot = {p: p.read_bytes() for p in md_dir.rglob("*") if p.is_file()}
+
+    plan = indexer.plan()
+    assert [(i.rel_path, i.reason, i.moved_from, i.metadata_only) for i in plan.to_index] == [
+        (NEW, Reason.MOVED, OLD, True)
+    ]
+    assert plan.to_index[0].markdown == md_dir / "custom/output.md"
+    assert plan.orphans == []
+    assert sorted(collection.get()["ids"]) == sorted(FILES)  # plan is read-only
+    monkeypatch.setattr(collection, "_embed", lambda **kw: pytest.fail("move re-embedded"))
+    done, progress = [], []
+    result = indexer.execute(
+        plan, prune=prune,
+        on_done=lambda *args: done.append(args), on_progress=lambda *args: progress.append(args),
+    )
+    assert result.moved == [NEW]
+    assert not result.indexed and not result.failed and not result.pruned
+    assert done == progress == [(plan.to_index[0], 1, 1)]
+    assert OLD not in collection.get()["ids"]
+    after = collection.get(ids=[NEW], include=["documents", "embeddings", "metadatas"])
+    assert after["documents"] == before["documents"]
+    assert (after["embeddings"] == before["embeddings"]).all()
+    meta = after["metadatas"][0]
+    assert meta["file"] == NEW and meta["markdown"] == "custom/output.md"
+    assert meta["fingerprint"] == f"fp:{OLD}" and meta["engine"] == "fake"
+    assert meta["filetype"] == "pdf" and meta["custom"] == "keep me"
+    assert "person" not in meta
+    assert {"archives", "renamed", "newtag", "contenttag"} <= set(meta["keywords"])
+    assert not {"estelle", "contrat", "oldtag"} & set(meta["keywords"])
+    assert not indexer.plan().to_index and not indexer.plan().orphans
+    assert snapshot == {p: p.read_bytes() for p in md_dir.rglob("*") if p.is_file()}
+
+
+def test_move_clears_all_optional_metadata(md_dir: Path, collection):
+    indexer = rules_indexer(md_dir, collection)
+    indexer.sync()
+    move_entry(md_dir, OLD, "a")  # no keywords, person or extension at the new path
+    plain = Indexer(md_dir, collection, embedding_name="fake")
+    assert plain.sync().moved == ["a"]
+    meta = collection.get(ids=["a"], include=["metadatas"])["metadatas"][0]
+    assert not {"person", "keywords", "filetype", "rules_sha256"} & meta.keys()
+
+
+def test_move_changes_person(indexer: Indexer, collection):
+    indexer.sync()
+    new = "personnes/Sylvain/document.txt"
+    move_entry(indexer.md_dir, OLD, new)
+    indexer.reload()
+    indexer.sync()
+    meta = collection.get(ids=[new], include=["metadatas"])["metadatas"][0]
+    assert meta["person"] == "Sylvain" and meta["filetype"] == "txt"
+    assert "sylvain" in meta["keywords"] and "estelle" not in meta["keywords"]
+
+
+@pytest.mark.parametrize("change", ["markdown", "embedding", "force", "select"])
+def test_move_reembeds_when_needed(indexer: Indexer, collection, monkeypatch, change):
+    indexer.sync()
+    move_entry(indexer.md_dir, OLD, NEW)
+    indexer.reload()
+    kwargs = {}
+    if change == "markdown":
+        (indexer.md_dir / "archives/renamed.md").write_text("Changed Markdown")
+    elif change == "embedding":
+        collection.update(ids=[OLD], metadatas=[{"embedding": "old-model"}])
+    elif change == "force":
+        kwargs["force"] = True
+    else:
+        kwargs["select"] = [NEW]
+    plan = indexer.plan(**kwargs)
+    item = next(i for i in plan.to_index if i.rel_path == NEW)
+    assert item.moved_from == OLD and not item.metadata_only
+    assert item.reason == {
+        "markdown": Reason.MARKDOWN_CHANGED, "embedding": Reason.EMBEDDING_CHANGED,
+        "force": Reason.FORCED, "select": Reason.FORCED,
+    }[change]
+    embedded = []
+    original = collection._embed
+    monkeypatch.setattr(collection, "_embed", lambda **kw: (embedded.append(kw), original(**kw))[1])
+    result = indexer.execute(plan)
+    assert result.moved == [NEW] and not result.failed
+    assert embedded
+    assert OLD not in collection.get()["ids"]
+    assert not indexer.plan().to_index
+
+
+@pytest.mark.parametrize("field", ["fingerprint", "engine"])
+def test_changed_source_is_not_a_move(indexer: Indexer, field):
+    indexer.sync()
+    move_entry(indexer.md_dir, OLD, NEW)
+    indexer.reload()
+    setattr(indexer.manifest.entries[NEW], field, "changed")
+    plan = indexer.plan()
+    assert plan.to_index[0].reason == Reason.NEW
+    assert plan.to_index[0].moved_from is None
+    assert plan.orphans == [OLD]
+
+
+@pytest.mark.parametrize("field", ["fingerprint", "engine"])
+def test_missing_identity_is_not_a_move(indexer: Indexer, collection, field):
+    indexer.sync()
+    collection.update(ids=[OLD], metadatas=[{field: None}])
+    move_entry(indexer.md_dir, OLD, NEW)
+    indexer.reload()
+    plan = indexer.plan()
+    assert plan.to_index[0].reason == Reason.NEW
+    assert plan.orphans == [OLD]
+
+
+def test_copy_is_new_not_moved(indexer: Indexer, collection):
+    indexer.sync()
+    indexer.manifest.entries[NEW] = indexer.manifest.entries[OLD]
+    plan = indexer.plan()
+    assert [(i.rel_path, i.reason, i.moved_from) for i in plan.to_index] == [(NEW, Reason.NEW, None)]
+    assert not plan.orphans
+    result = indexer.execute(plan, prune=True)
+    assert result.indexed == [NEW] and not result.moved
+    assert OLD in collection.get()["ids"]
+
+
+@pytest.mark.parametrize("old_count,new_count", [(1, 2), (2, 1), (2, 2)])
+def test_duplicate_moves_are_paired_once(collection, monkeypatch, old_count, new_count):
+    entry = {"fingerprint": "same", "engine": "fake", "output": ""}
+    manifest = Manifest.from_entries({f"old/{i}.pdf": entry for i in range(old_count)})
+    indexer = Indexer(None, collection, manifest=manifest, embedding_name="fake", read_markdown=lambda rel: "same")
+    indexer.sync()
+    indexer.manifest = Manifest.from_entries({f"new/{i}.pdf": entry for i in reversed(range(new_count))})
+    plan = indexer.plan()
+    moves = {i.rel_path: i.moved_from for i in plan.to_index if i.moved_from is not None}
+    assert moves == {f"new/{i}.pdf": f"old/{i}.pdf" for i in range(min(old_count, new_count))}
+    if old_count >= new_count:
+        monkeypatch.setattr(collection, "_embed", lambda **kw: pytest.fail("move re-embedded"))
+    result = indexer.execute(plan, prune=True, batch_size=1)
+    assert len(result.moved) == min(old_count, new_count)
+    assert len(result.indexed) == max(0, new_count - old_count)
+    assert len(result.pruned) == max(0, old_count - new_count)
+    assert not result.failed
+    assert sorted(collection.get()["ids"]) == [f"new/{i}.pdf" for i in range(new_count)]
+    assert not indexer.plan().to_index and not indexer.plan().orphans
+
+
+def test_select_does_not_prune_unselected_moves(indexer: Indexer, collection):
+    indexer.sync()
+    move_entry(indexer.md_dir, OLD, NEW)
+    move_entry(indexer.md_dir, "docs/notes.txt", "elsewhere/notes.txt")
+    indexer.reload()
+    plan = indexer.plan(select=[NEW])
+    assert not plan.orphans
+    result = indexer.execute(plan, prune=True)
+    assert result.moved == [NEW]
+    assert sorted(collection.get()["ids"]) == [NEW, "docs/notes.txt"]
+    assert indexer.sync(prune=True).moved == ["elsewhere/notes.txt"]
+
+
+@pytest.mark.parametrize("failure", ["plan-read", "execute-read", "empty", "write", "embed", "delete"])
+def test_move_failure_preserves_source(indexer: Indexer, collection, monkeypatch, failure):
+    indexer.sync()
+    move_entry(indexer.md_dir, OLD, NEW)
+    indexer.reload()
+    if failure == "plan-read":
+        (indexer.md_dir / "archives/renamed.md").unlink()
+    plan = indexer.plan(force=failure == "embed")
+    if failure == "execute-read":
+        (indexer.md_dir / "archives/renamed.md").unlink()
+    elif failure == "empty":
+        (indexer.md_dir / "archives/renamed.md").write_text("")
+
+    def fail(**kwargs):
+        raise RuntimeError("simulated failure")
+
+    if failure in ("write", "embed", "delete"):
+        monkeypatch.setattr(collection, {"write": "upsert", "embed": "_embed", "delete": "delete"}[failure], fail)
+    errors = []
+    result = indexer.execute(plan, prune=True, on_error=lambda *args: errors.append(args))
+    assert NEW in result.failed
+    assert not result.moved and not result.pruned
+    assert OLD in collection.get()["ids"]
+    assert (NEW in collection.get()["ids"]) == (failure == "delete")
+    if failure != "plan-read":
+        assert errors and errors[0][0].rel_path == NEW
+
+
+@pytest.mark.parametrize("change", ["markdown", "embedding"])
+def test_move_rechecks_embedding_reuse_at_execution(indexer: Indexer, collection, monkeypatch, change):
+    indexer.sync()
+    move_entry(indexer.md_dir, OLD, NEW)
+    indexer.reload()
+    plan = indexer.plan()
+    assert plan.to_index[0].metadata_only
+    if change == "markdown":
+        (indexer.md_dir / "archives/renamed.md").write_text("Changed after planning")
+    else:
+        collection.update(ids=[OLD], metadatas=[{"embedding": "other-model"}])
+    embedded = []
+    original = collection._embed
+    monkeypatch.setattr(collection, "_embed", lambda **kw: (embedded.append(kw), original(**kw))[1])
+    assert indexer.execute(plan).moved == [NEW]
+    assert embedded
+    assert not indexer.plan().to_index
+
+
+@pytest.mark.parametrize("change", ["delete", "fingerprint", "engine"])
+def test_stale_move_source_fails_safely(indexer: Indexer, collection, change):
+    indexer.sync()
+    move_entry(indexer.md_dir, OLD, NEW)
+    indexer.reload()
+    plan = indexer.plan()
+    if change == "delete":
+        collection.delete(ids=[OLD])
+    else:
+        collection.update(ids=[OLD], metadatas=[{change: "changed-after-planning"}])
+    result = indexer.execute(plan, prune=True)
+    assert "move source" in result.failed[NEW]
+    assert not result.moved and not result.pruned
+    assert NEW not in collection.get()["ids"]
+    assert (OLD in collection.get()["ids"]) == (change != "delete")
+
+
+def test_retag_handles_moves(indexer: Indexer, collection, monkeypatch):
+    indexer.sync()
+    move_entry(indexer.md_dir, OLD, NEW)
+    indexer.reload()
+    monkeypatch.setattr(collection, "_embed", lambda **kw: pytest.fail("retag re-embedded"))
+    result = indexer.sync(retag=True)
+    assert result.moved == [NEW] and result.indexed == ["docs/notes.txt"]
+    assert not result.failed
+
+
+def test_move_and_prune_unrelated_orphan(indexer: Indexer, collection):
+    indexer.sync()
+    move_entry(indexer.md_dir, OLD, NEW)
+    indexer.reload()
+    del indexer.manifest.entries["docs/notes.txt"]
+    plan = indexer.plan()
+    assert plan.orphans == ["docs/notes.txt"]
+    result = indexer.execute(plan, prune=True)
+    assert result.moved == [NEW] and result.pruned == ["docs/notes.txt"]
+    assert collection.get()["ids"] == [NEW]
