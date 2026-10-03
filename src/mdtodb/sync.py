@@ -11,15 +11,17 @@ any of the following holds:
 * the recorded embedding identifier differs from the one in use,
 * it was explicitly selected / ``force`` was requested.
 
-Collection ids are the manifest's relative source paths. Ids present in the
-collection but absent from the manifest are orphans, deleted only with
-``prune``.
+Collection ids are the manifest's relative source paths. New paths matching
+a vanished entry's engine and fingerprint are moves: existing embeddings are
+reused if the Markdown and embedding identifier are unchanged. Other ids
+absent from the manifest are orphans, deleted only with ``prune``.
 """
 
 from __future__ import annotations
 
 import hashlib
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path, PurePosixPath
@@ -41,6 +43,7 @@ _OPTIONAL_META_KEYS = ("keywords", "rules_sha256", "person", "filetype")
 
 class Reason(str, Enum):
     NEW = "new"
+    MOVED = "moved"
     CHANGED = "changed"
     MARKDOWN_CHANGED = "markdown-changed"
     EMBEDDING_CHANGED = "embedding-changed"
@@ -55,6 +58,7 @@ class PlannedItem:
     markdown: Path | None  # absolute path of the .md to index, None in disk-less mode
     reason: Reason
     metadata_only: bool = False
+    moved_from: str | None = None
 
 
 @dataclass
@@ -70,6 +74,7 @@ class IndexResult:
     indexed: list[str] = field(default_factory=list)
     failed: dict[str, str] = field(default_factory=dict)
     pruned: list[str] = field(default_factory=list)
+    moved: list[str] = field(default_factory=list)
 
 
 def md_sha256(text: str) -> str:
@@ -106,6 +111,7 @@ class Indexer:
             self.manifest = manifest
 
     def _load_manifest(self) -> Manifest:
+        assert self.md_dir is not None
         path = self.md_dir / MANIFEST_NAME
         if not path.exists():
             raise FileNotFoundError(f"no pdftomd manifest at {path} — run `pdftomd sync` first")
@@ -116,6 +122,7 @@ class Indexer:
         self.manifest = self._load_manifest()
 
     def _read_from_disk(self, rel_path: str) -> str:
+        assert self.md_dir is not None
         entry = self.manifest.entries[rel_path]
         output = entry.output or markdown_path_for(rel_path)
         return (self.md_dir / output).read_text("utf-8")
@@ -148,7 +155,7 @@ class Indexer:
         while True:
             page = self.collection.get(limit=_BATCH_GET, offset=offset, include=["metadatas"])
             for _id, meta in zip(page["ids"], page["metadatas"] or []):
-                state[_id] = meta or {}
+                state[_id] = dict(meta or {})
             if len(page["ids"]) < _BATCH_GET:
                 break
             offset += _BATCH_GET
@@ -171,6 +178,7 @@ class Indexer:
         selected = {self._rel(s) for s in select} if select else None
         plan = IndexPlan()
         state = self._collection_state()
+        moves = self._detect_moves(state)
 
         for rel, entry in self.manifest.entries.items():
             if selected is not None and rel not in selected:
@@ -181,7 +189,8 @@ class Indexer:
                 plan.errors[rel] = str(exc)
                 continue
             metadata_only = False
-            existing = state.get(rel)
+            moved_from = moves.get(rel)
+            existing = state.get(moved_from if moved_from is not None else rel)
             if existing is None:
                 reason = Reason.NEW
             elif selected is not None or force:
@@ -192,6 +201,8 @@ class Indexer:
                 reason = Reason.MARKDOWN_CHANGED
             elif existing.get("embedding") != self.embedding_name:
                 reason = Reason.EMBEDDING_CHANGED
+            elif moved_from is not None:
+                reason, metadata_only = Reason.MOVED, True
             elif retag:
                 reason, metadata_only = Reason.RETAG, True
             elif existing.get("rules_sha256") != self._rules_sha:
@@ -199,15 +210,34 @@ class Indexer:
             else:
                 plan.up_to_date.append(rel)
                 continue
-            plan.to_index.append(PlannedItem(rel, self._markdown_path(rel), reason, metadata_only))
+            plan.to_index.append(PlannedItem(rel, self._markdown_path(rel), reason, metadata_only, moved_from))
 
         if selected is not None:
             missing = selected - set(self.manifest.entries)
             if missing:
                 raise FileNotFoundError(f"Selected files not found in manifest: {sorted(missing)}")
 
-        plan.orphans = sorted(set(state) - set(self.manifest.entries))
+        # Reserve all matched sources, including unreadable or unselected
+        # destinations: pruning must not discard a move that hasn't succeeded.
+        plan.orphans = sorted(set(state) - set(self.manifest.entries) - set(moves.values()))
         return plan
+
+    def _detect_moves(self, state: dict[str, dict]) -> dict[str, str]:
+        """Pair new paths with vanished ids, once each, like pdftomd."""
+        vanished: dict[tuple[str, str], deque[str]] = defaultdict(deque)
+        for rel in sorted(set(state) - set(self.manifest.entries)):
+            meta = state[rel]
+            engine, fingerprint = meta.get("engine"), meta.get("fingerprint")
+            if engine and fingerprint:
+                vanished[(engine, fingerprint)].append(rel)
+
+        moves = {}
+        for rel in sorted(set(self.manifest.entries) - set(state)):
+            entry = self.manifest.entries[rel]
+            candidates = vanished.get((entry.engine, entry.fingerprint))
+            if candidates:
+                moves[rel] = candidates.popleft()
+        return moves
 
     # -- execution -----------------------------------------------------------
 
@@ -225,6 +255,31 @@ class Indexer:
             text=markdown,
             rules=self.rules,
         )
+
+    def _move(self, item: PlannedItem, markdown: str, meta: dict) -> None:
+        assert item.moved_from is not None
+        previous = self.collection.get(ids=[item.moved_from], include=["metadatas", "embeddings"])
+        if not previous["ids"]:
+            raise ValueError(f"move source no longer exists: {item.moved_from}")
+        old_meta = dict((previous["metadatas"] or [{}])[0] or {})
+        if any(old_meta.get(key) != meta[key] for key in ("engine", "fingerprint")):
+            raise ValueError(f"move source changed: {item.moved_from}")
+
+        embeddings = None
+        if item.metadata_only and all(
+            old_meta.get(key) == meta[key] for key in ("md_sha256", "embedding")
+        ):
+            embeddings = previous["embeddings"]
+
+        # Chroma cannot rename an id. Write the replacement first; never delete
+        # the source if reading, embedding or writing the destination fails.
+        self.collection.upsert(
+            ids=[item.rel_path],
+            documents=[markdown],
+            embeddings=embeddings,
+            metadatas=[old_meta | meta | {k: None for k in _OPTIONAL_META_KEYS if k not in meta}],
+        )
+        self.collection.delete(ids=[item.moved_from])
 
     def execute(
         self,
@@ -297,12 +352,18 @@ class Indexer:
                 if not markdown:
                     raise ValueError("empty markdown")
                 meta = self._item_metadata(item, markdown)
+                if item.moved_from is not None:
+                    self._move(item, markdown, meta)
             except Exception as exc:
                 result.failed[item.rel_path] = str(exc)
                 if on_error:
                     on_error(item, exc)
                 continue
-            if item.metadata_only:
+            if item.moved_from is not None:
+                result.moved.append(item.rel_path)
+                if on_done:
+                    on_done(item, index, total)
+            elif item.metadata_only:
                 meta_batch.append((item, meta, index))
                 if len(meta_batch) >= batch_size:
                     flush_meta()
