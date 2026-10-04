@@ -109,12 +109,15 @@ def _print_plan(plan: IndexPlan, *, verbose: bool) -> None:
 
 
 def _run(indexer: Indexer, plan: IndexPlan, prune: bool, batch_size: int) -> int:
-    def done(item: PlannedItem, i: int, n: int) -> None:
+    def describe(item: PlannedItem) -> str:
         path = f"{item.moved_from} -> {item.rel_path}" if item.moved_from is not None else item.rel_path
-        typer.echo(f"[{i}/{n}] {path} ({item.reason.value})", err=True)
+        return f"{path} ({item.reason.value})"
 
-    def error(item: PlannedItem, exc: Exception) -> None:
-        typer.secho(f"  FAILED {item.rel_path}: {exc}", fg=typer.colors.RED, err=True)
+    def done(item: PlannedItem, i: int, n: int) -> None:
+        typer.echo(f"[{i}/{n}] {describe(item)}", err=True)
+
+    def error(item: PlannedItem, exc: Exception, i: int, n: int) -> None:
+        typer.secho(f"[{i}/{n}] {describe(item)} FAILED: {exc}", fg=typer.colors.RED, err=True)
 
     result = indexer.execute(plan, prune=prune, batch_size=batch_size, on_done=done, on_error=error)
     typer.echo(
