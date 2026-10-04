@@ -20,7 +20,7 @@ FILES = {"personnes/Estelle/papiers/contrat.pdf": "# Contrat\n\nHello world."}
 
 @pytest.fixture(autouse=True)
 def fake_embedding(monkeypatch):
-    monkeypatch.setattr(cli, "_embedding", lambda name, model, api_key: (FakeEmbedding(), "fake"))
+    monkeypatch.setattr(cli, "_embedding", lambda name, model, api_key, *args: (FakeEmbedding(), "fake"))
 
 
 @pytest.fixture
