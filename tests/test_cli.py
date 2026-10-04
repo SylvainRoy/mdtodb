@@ -180,3 +180,31 @@ def test_move_flow(md_dir: Path, tmp_path: Path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert new in result.stdout and old not in result.stdout
     assert "person: Estelle" not in result.stdout
+
+
+def test_failed_item_reports_action(md_dir: Path, tmp_path: Path, monkeypatch):
+    chroma = tmp_path / "chroma"
+    rel = "personnes/Estelle/papiers/contrat.pdf"
+
+    def boom(self, input):
+        raise RuntimeError("embedding down")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(FakeEmbedding, "__call__", boom)
+        result = runner.invoke(app, ["sync", str(md_dir), str(chroma)])
+    assert result.exit_code == 1
+    assert f"[1/1] {rel} (new) FAILED: " in result.stderr and "embedding down" in result.stderr
+
+    assert runner.invoke(app, ["sync", str(md_dir), str(chroma)]).exit_code == 0
+    new = "archives/renamed.pdf"
+    move_entry(md_dir, rel, new)
+    (md_dir / rel).with_suffix(".md").unlink(missing_ok=True)
+
+    def failing_move(self, item, markdown, meta):
+        raise RuntimeError("move down")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.Indexer, "_move", failing_move)
+        result = runner.invoke(app, ["sync", str(md_dir), str(chroma)])
+    assert result.exit_code == 1
+    assert f"[1/1] {rel} -> {new} (moved) FAILED: move down" in result.stderr

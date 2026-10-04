@@ -289,7 +289,7 @@ class Indexer:
         batch_size: int = 50,
         on_progress: Callable[[PlannedItem, int, int], None] | None = None,
         on_done: Callable[[PlannedItem, int, int], None] | None = None,
-        on_error: Callable[[PlannedItem, Exception], None] | None = None,
+        on_error: Callable[[PlannedItem, Exception, int, int], None] | None = None,
     ) -> IndexResult:
         result = IndexResult()
         result.failed.update(plan.errors)
@@ -308,10 +308,10 @@ class Indexer:
                     metadatas=[meta for *_, meta, _ in batch],
                 )
             except Exception as exc:
-                for item, _doc, _meta, _i in batch:
+                for item, _doc, _meta, i in batch:
                     result.failed[item.rel_path] = str(exc)
                     if on_error:
-                        on_error(item, exc)
+                        on_error(item, exc, i, total)
             else:
                 for item, _doc, _meta, i in batch:
                     result.indexed.append(item.rel_path)
@@ -333,10 +333,10 @@ class Indexer:
                     ],
                 )
             except Exception as exc:
-                for item, _meta, _i in meta_batch:
+                for item, _meta, i in meta_batch:
                     result.failed[item.rel_path] = str(exc)
                     if on_error:
-                        on_error(item, exc)
+                        on_error(item, exc, i, total)
             else:
                 for item, _meta, i in meta_batch:
                     result.indexed.append(item.rel_path)
@@ -357,7 +357,7 @@ class Indexer:
             except Exception as exc:
                 result.failed[item.rel_path] = str(exc)
                 if on_error:
-                    on_error(item, exc)
+                    on_error(item, exc, index, total)
                 continue
             if item.moved_from is not None:
                 result.moved.append(item.rel_path)
