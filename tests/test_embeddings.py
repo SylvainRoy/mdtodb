@@ -57,3 +57,13 @@ def test_gemini_client_retries_rate_limits(fake_genai):
 def test_gemini_rejects_bad_batch_size(fake_genai):
     with pytest.raises(ValueError, match="batch size"):
         get_embedding("gemini", batch_size=0)
+
+
+def test_gemini_strips_data_uris_and_caps_length(fake_genai):
+    ef, _ = get_embedding("gemini", batch_size=10, max_chars=20)
+    blob = "![][image1]\n\n[image1]: <data:image/png;base64," + "iVBORw0KGgo" * 50 + ">\n"
+    ef(["short text " + blob, "x" * 100])
+    [sent] = ef.client.models.calls
+    assert sent[0] == "short text ![][image1]\n\n[image1]: <>\n"[:20]
+    assert "base64" not in sent[0]
+    assert sent[1] == "x" * 20
