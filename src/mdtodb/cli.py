@@ -8,7 +8,7 @@ from typing import Optional
 import typer
 
 from . import __version__
-from .embeddings import DEFAULT_GEMINI_MODEL, EMBEDDINGS, get_embedding
+from .embeddings import DEFAULT_EMBED_BATCH_SIZE, DEFAULT_GEMINI_MODEL, EMBEDDINGS, get_embedding
 from .metadata import metadata_for, normalize_keyword
 from .rules import KeywordRules, RulesError, load_rules
 from .store import open_collection
@@ -27,14 +27,15 @@ Port = typer.Option(8000, "--port", help="Chroma server port.")
 Embedding = typer.Option("default", "--embedding", "-e", help=f"Embedding function: {', '.join(EMBEDDINGS)}.", case_sensitive=False)
 GeminiModel = typer.Option(DEFAULT_GEMINI_MODEL, "--gemini-model", help="(gemini) Embedding model name.")
 GeminiKey = typer.Option(None, "--gemini-api-key", envvar="GEMINI_API_KEY", help="(gemini) API key.", show_default=False)
+EmbedBatchSize = typer.Option(DEFAULT_EMBED_BATCH_SIZE, "--embed-batch-size", min=1, help="(gemini) Documents per embedding API request.")
 Stopword = typer.Option(None, "--stopword", "-w", help="Extra keyword stopword. Repeatable.")
 BatchSize = typer.Option(50, "--batch-size", min=1, help="Documents upserted per Chroma call.")
 Rules = typer.Option(None, "--rules", "-r", envvar="MDTODB_RULES", help="Keyword rules TOML file (default: ~/.config/mdtodb/rules.toml if present).")
 
 
-def _embedding(name: str, model: str, api_key: Optional[str]):
+def _embedding(name: str, model: str, api_key: Optional[str], embed_batch_size: int = DEFAULT_EMBED_BATCH_SIZE):
     """Resolve the embedding function — monkeypatched by tests to stay offline."""
-    return get_embedding(name, model_name=model, api_key=api_key)
+    return get_embedding(name, model_name=model, api_key=api_key, batch_size=embed_batch_size)
 
 
 def _chroma_target(chroma: Optional[Path], host: Optional[str]) -> None:
@@ -51,10 +52,11 @@ def _collection(
     embedding: str,
     model: str,
     api_key: Optional[str],
+    embed_batch_size: int = DEFAULT_EMBED_BATCH_SIZE,
 ):
     _chroma_target(chroma, host)
     try:
-        ef, ef_name = _embedding(embedding, model, api_key)
+        ef, ef_name = _embedding(embedding, model, api_key, embed_batch_size)
         return open_collection(
             chroma,
             host=host,
@@ -148,6 +150,7 @@ def sync(
     embedding: str = Embedding,
     gemini_model: str = GeminiModel,
     gemini_api_key: Optional[str] = GeminiKey,
+    embed_batch_size: int = EmbedBatchSize,
     stopword: Optional[list[str]] = Stopword,
     rules: Optional[Path] = Rules,
     batch_size: int = BatchSize,
@@ -158,7 +161,7 @@ def sync(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Also list up-to-date documents."),
 ) -> None:
     """Synchronise MD_DIR into a Chroma collection, reindexing only stale documents."""
-    coll, ef_name = _collection(chroma, host, port, collection, embedding, gemini_model, gemini_api_key)
+    coll, ef_name = _collection(chroma, host, port, collection, embedding, gemini_model, gemini_api_key, embed_batch_size)
     indexer = _indexer(md_dir, coll, ef_name, stopword, _rules(rules))
     try:
         plan = indexer.plan(force=force, select=select or None)
@@ -181,12 +184,13 @@ def list_cmd(
     embedding: str = Embedding,
     gemini_model: str = GeminiModel,
     gemini_api_key: Optional[str] = GeminiKey,
+    embed_batch_size: int = EmbedBatchSize,
     stopword: Optional[list[str]] = Stopword,
     rules: Optional[Path] = Rules,
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Also list up-to-date documents."),
 ) -> None:
     """List the documents that would be (re)indexed, without writing anything."""
-    coll, ef_name = _collection(chroma, host, port, collection, embedding, gemini_model, gemini_api_key)
+    coll, ef_name = _collection(chroma, host, port, collection, embedding, gemini_model, gemini_api_key, embed_batch_size)
     plan = _indexer(md_dir, coll, ef_name, stopword, _rules(rules)).plan()
     _print_plan(plan, verbose=verbose)
     raise typer.Exit(1 if plan.errors else 0)
@@ -202,6 +206,7 @@ def watch(
     embedding: str = Embedding,
     gemini_model: str = GeminiModel,
     gemini_api_key: Optional[str] = GeminiKey,
+    embed_batch_size: int = EmbedBatchSize,
     stopword: Optional[list[str]] = Stopword,
     rules: Optional[Path] = Rules,
     batch_size: int = BatchSize,
@@ -209,7 +214,7 @@ def watch(
     prune: bool = typer.Option(False, "--prune", help="Delete collection items whose document left the manifest."),
 ) -> None:
     """Keep the collection in sync with MD_DIR, re-reading the manifest periodically."""
-    coll, ef_name = _collection(chroma, host, port, collection, embedding, gemini_model, gemini_api_key)
+    coll, ef_name = _collection(chroma, host, port, collection, embedding, gemini_model, gemini_api_key, embed_batch_size)
     indexer = _indexer(md_dir, coll, ef_name, stopword, _rules(rules))
     typer.echo(f"watching {md_dir} every {interval:g}s (Ctrl-C to stop)", err=True)
     try:
@@ -233,6 +238,7 @@ def query(
     embedding: str = Embedding,
     gemini_model: str = GeminiModel,
     gemini_api_key: Optional[str] = GeminiKey,
+    embed_batch_size: int = EmbedBatchSize,
     results: int = typer.Option(5, "--results", "-n", min=1, help="Number of hits."),
     person: Optional[str] = typer.Option(None, "--person", help="Restrict to this person directory."),
     keyword: Optional[list[str]] = typer.Option(None, "--keyword", "-k", help="Restrict to documents containing this keyword. Repeatable."),
@@ -245,7 +251,7 @@ def query(
     chroma = Path(target) if text is not None else None
     if text is None:
         text = target
-    coll, _ef_name = _collection(chroma, host, port, collection, embedding, gemini_model, gemini_api_key)
+    coll, _ef_name = _collection(chroma, host, port, collection, embedding, gemini_model, gemini_api_key, embed_batch_size)
     clauses: list[dict] = []
     if person:
         clauses.append({"person": person})
@@ -280,13 +286,14 @@ def retag(
     embedding: str = Embedding,
     gemini_model: str = GeminiModel,
     gemini_api_key: Optional[str] = GeminiKey,
+    embed_batch_size: int = EmbedBatchSize,
     stopword: Optional[list[str]] = Stopword,
     rules: Optional[Path] = Rules,
     batch_size: int = BatchSize,
     dry_run: bool = typer.Option(False, "--dry-run", "-n", help="List what would be re-tagged and exit."),
 ) -> None:
     """Recompute metadata (keywords, person, filetype) for every indexed document without re-embedding."""
-    coll, ef_name = _collection(chroma, host, port, collection, embedding, gemini_model, gemini_api_key)
+    coll, ef_name = _collection(chroma, host, port, collection, embedding, gemini_model, gemini_api_key, embed_batch_size)
     indexer = _indexer(md_dir, coll, ef_name, stopword, _rules(rules))
     plan = indexer.plan(retag=True)
     _print_plan(plan, verbose=dry_run)

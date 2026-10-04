@@ -23,7 +23,11 @@ uv sync --extra all
 Requires Python 3.10-3.13.
 
 The Gemini key comes from `GEMINI_API_KEY` (or `GOOGLE_API_KEY`), or
-`--gemini-api-key`.
+`--gemini-api-key`. Documents are embedded `--embed-batch-size` at a time
+(default 100 per API request; `gemini-embedding-001` reads at most 2,048
+tokens per document, so a request stays around 200k tokens), and requests
+failing with `429 RESOURCE_EXHAUSTED` or a 5xx are retried with exponential
+backoff before the document is reported as failed.
 
 ## CLI
 
