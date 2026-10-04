@@ -27,7 +27,11 @@ The Gemini key comes from `GEMINI_API_KEY` (or `GOOGLE_API_KEY`), or
 (default 100 per API request; `gemini-embedding-001` reads at most 2,048
 tokens per document, so a request stays around 200k tokens), and requests
 failing with `429 RESOURCE_EXHAUSTED` or a 5xx are retried with exponential
-backoff before the document is reported as failed.
+backoff before the document is reported as failed. The text sent to Gemini
+has base64 `data:` URIs (images embedded in Google Docs exports) removed and
+is capped at 8,000 characters — the model only reads the first 2,048 tokens
+anyway — so a single document cannot exhaust the per-minute token quota. The
+full Markdown is still stored in Chroma.
 
 ## CLI
 
