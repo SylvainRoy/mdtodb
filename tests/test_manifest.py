@@ -71,3 +71,13 @@ def test_from_entries():
 def test_markdown_path_for():
     assert markdown_path_for("a/b.pdf") == "a/b.md"
     assert markdown_path_for("x.PNG") == "x.md"
+
+
+def test_source_url_optional():
+    url = "https://drive.google.com/file/d/synthetic-id/view"
+    manifest = Manifest.from_dict({"files": {
+        "with.pdf": {"fingerprint": "f", "engine": "e", "output": "with.md", "source_url": url},
+        "without.pdf": {"fingerprint": "f", "engine": "e", "output": "without.md"},
+    }})
+    assert manifest.entries["with.pdf"].source_url == url
+    assert manifest.entries["without.pdf"].source_url is None

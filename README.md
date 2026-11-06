@@ -191,6 +191,12 @@ component (case-insensitive): `personnes/Estelle/papiers/x.pdf` →
 
 ## Library
 
+The read-only `CorpusReader` includes `source_url` in document information
+and excerpts returned by listing, reading, finding text, and lexical, semantic,
+or hybrid search. It reads this optional field directly from the pdftomd
+manifest on each operation; older entries without it return `None` (JSON
+`null`). URLs are not stored in Chroma, so URL updates require no reindexing.
+
 ```python
 from mdtodb import Indexer, Manifest, open_collection
 
