@@ -58,6 +58,7 @@ class DocumentInfo:
     embedding: str | None
     index_state: str
     markdown_sha256: str | None
+    source_url: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -72,6 +73,7 @@ class Excerpt:
     start_offset: int
     end_offset: int
     text: str
+    source_url: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -185,6 +187,9 @@ class CorpusReader:
                 raise ReaderError("Corpus manifest is not valid")
             output = value.get("output")
             if output is not None and not isinstance(output, str):
+                raise ReaderError("Corpus manifest is not valid")
+            source_url = value.get("source_url")
+            if source_url is not None and not isinstance(source_url, str):
                 raise ReaderError("Corpus manifest is not valid")
             size = value.get("size")
             if size is not None and (
@@ -346,6 +351,7 @@ class CorpusReader:
             embedding=meta.get("embedding") if meta else None,
             index_state=self._index_state(snap, entry, meta, md_hash),
             markdown_sha256=md_hash,
+            source_url=entry.source_url,
         )
 
     def _doc_keywords(self, snap: _Snapshot, document_id: str) -> set[str]:
@@ -382,7 +388,7 @@ class CorpusReader:
         return out
 
 
-    def _excerpt(self, document_id: str, text: str, md_hash: str, start: int, end: int) -> Excerpt:
+    def _excerpt(self, snap: _Snapshot, document_id: str, text: str, md_hash: str, start: int, end: int) -> Excerpt:
         start = max(0, start)
         end = min(len(text), end)
         return Excerpt(
@@ -393,6 +399,7 @@ class CorpusReader:
             start_offset=start,
             end_offset=end,
             text=text[start:end],
+            source_url=snap.manifest.entries[document_id].source_url,
         )
 
 
@@ -469,7 +476,7 @@ class CorpusReader:
         md_hash = md_sha256(text)
         return {
             "document": self._document_info(snap, document_id, md_hash).to_dict(),
-            "excerpt": self._excerpt(document_id, text, md_hash, offset, end).to_dict(),
+            "excerpt": self._excerpt(snap, document_id, text, md_hash, offset, end).to_dict(),
             "total_chars": len(text),
             "total_lines": 0 if not text else text.count("\n") + (0 if text.endswith("\n") else 1),
             "next_offset": end if end < len(text) else None,
@@ -505,7 +512,7 @@ class CorpusReader:
                 {
                     "match_start": match.start(),
                     "match_end": match.end(),
-                    "excerpt": self._excerpt(document_id, text, md_hash, start, end).to_dict(),
+                    "excerpt": self._excerpt(snap, document_id, text, md_hash, start, end).to_dict(),
                 }
             )
         return {
@@ -630,7 +637,7 @@ class CorpusReader:
                     "document_id": document_id,
                     "document": self._document_info(snap, document_id, md_hash).to_dict(),
                     "excerpt": self._excerpt(
-                        document_id, text, md_hash, start, start + EXCERPT_CHARS
+                        snap, document_id, text, md_hash, start, start + EXCERPT_CHARS
                     ).to_dict(),
                     "matched_by": ["lexical"],
                     "distance": None,
@@ -694,7 +701,7 @@ class CorpusReader:
             try:
                 text = self._read_document_text(doc_id, entry)
                 md_hash = md_sha256(text)
-                excerpt = self._excerpt(doc_id, text, md_hash, 0, EXCERPT_CHARS).to_dict()
+                excerpt = self._excerpt(snap, doc_id, text, md_hash, 0, EXCERPT_CHARS).to_dict()
             except ReaderError:
                 unreadable.append(doc_id)
             hits.append(

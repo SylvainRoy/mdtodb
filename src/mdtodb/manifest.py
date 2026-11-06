@@ -23,6 +23,7 @@ class ManifestEntry:
     size: int = 0
     mtime: float = 0.0
     generated_at: float = 0.0
+    source_url: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "ManifestEntry":

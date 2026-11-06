@@ -481,6 +481,47 @@ def semantic_reader(md_dir, collection, ef=None):
     reader = CorpusReader(md_dir, collection_factory=factory, embedding_factory=ef_factory)
     return reader, ef
 
+
+@pytest.mark.parametrize("url_field", [{}, {"source_url": None}, {
+    "source_url": "https://docs.google.com/document/d/synthetic-id/edit"
+}])
+def test_source_url_across_reader_operations(tmp_path, collection, url_field):
+    doc_id = "a/doc.pdf"
+    md_dir = make_tree(tmp_path, {doc_id: "# Synthetic document\n\nFind this needle.\n"}, {
+        doc_id: {"fingerprint": "fp", "engine": "fake", "output": "a/doc.md", **url_field}
+    })
+    index(collection, md_dir)
+    reader, _ = semantic_reader(md_dir, collection)
+    expected = url_field.get("source_url")
+    assert reader.list_documents()["documents"][0]["source_url"] == expected
+    read = reader.read_document(doc_id)
+    assert read["document"]["source_url"] == expected
+    assert read["excerpt"]["source_url"] == expected
+    found = reader.find_in_document(doc_id, "needle")
+    assert found["document"]["source_url"] == expected
+    assert found["matches"][0]["excerpt"]["source_url"] == expected
+    assert reader.find_in_document(doc_id, "absent")["matches"] == []
+    for mode in ("lexical", "semantic", "hybrid"):
+        results = reader.search_documents("needle", mode=mode)["results"]
+        assert len(results) == 1
+        assert results[0]["document"]["source_url"] == expected
+        assert results[0]["excerpt"]["source_url"] == expected
+
+    manifest_path = md_dir / MANIFEST_NAME
+    data = json.loads(manifest_path.read_text())
+    data["files"][doc_id]["source_url"] = "https://drive.google.com/file/d/updated/view"
+    manifest_path.write_text(json.dumps(data))
+    assert reader.read_document(doc_id)["document"]["source_url"].endswith("/updated/view")
+    assert "source_url" not in collection.get(ids=[doc_id], include=["metadatas"])["metadatas"][0]
+
+
+def test_invalid_source_url_rejected(tmp_path):
+    md_dir = make_tree(tmp_path, {"a.pdf": "# Document"}, {
+        "a.pdf": {"fingerprint": "fp", "engine": "fake", "output": "a.md", "source_url": 42}
+    })
+    with pytest.raises(ReaderError, match="Corpus manifest is not valid"):
+        CorpusReader(md_dir).list_documents()
+
 def test_embedder_not_used_for_non_semantic(md_dir: Path, collection):
     index(collection, md_dir)
     ef = SpyEmbedding()
